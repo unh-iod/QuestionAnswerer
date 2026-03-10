@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ACS Disability Statistics Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@300;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+
+  <div class="app-shell">
+
+    <!-- ── SIDEBAR ── -->
+    <aside class="sidebar" id="sidebar">
+
+      <div class="sidebar-header">
+        <div class="sidebar-logo">
+          <span class="logo-mark">ASC</span>
+          <span class="logo-sub">Disability<br>Statistics Explorer</span>
+        </div>
+      </div>
+
+      <div class="sidebar-body" id="sidebarSteps">
+
+        <!-- STEP 1: Measure + Disability -->
+        <section class="step" id="step1">
+          <div class="step-header">
+            <span class="step-num">01</span>
+            <span class="step-title">What statistics are you interested in?</span>
+          </div>
+          <div class="step-body">
+            <label class="field-label">Geographic Level</label>
+            <div class="seg-control" id="geoLevelControl">
+              <button class="seg-btn active" data-value="state">US / State</button>
+              <button class="seg-btn" data-value="county">County</button>
+            </div>
+
+            <label class="field-label mt">Disability Type</label>
+            <select id="selectDisability" class="sel"></select>
+
+            <label class="field-label mt">Measure</label>
+            <div id="measureGroups" class="measure-grid"></div>
+          </div>
+        </section>
+
+        <!-- STEP 2: Geography Selection -->
+        <section class="step locked" id="step2">
+          <div class="step-header">
+            <span class="step-num">02</span>
+            <span class="step-title">Select Geographies</span>
+          </div>
+          <div class="step-body">
+            <div class="search-wrap">
+              <input type="text" id="geoSearch" class="geo-search" placeholder="Search…" />
+            </div>
+            <div id="geoList" class="geo-list"></div>
+            <div class="geo-actions">
+              <button class="link-btn" id="btnSelectAll">Select all</button>
+              <button class="link-btn" id="btnClearAll">Clear</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- STEP 3: Year -->
+        <section class="step locked" id="step3">
+          <div class="step-header">
+            <span class="step-num">03</span>
+            <span class="step-title">Select Year(s)</span>
+          </div>
+          <div class="step-body">
+            <div class="seg-control" id="yearModeControl">
+              <button class="seg-btn active" data-value="single">Single Year</button>
+              <button class="seg-btn" data-value="all">All Years</button>
+            </div>
+            <div id="yearPickerWrap" class="mt">
+              <label class="field-label">Year</label>
+              <select id="selectYear" class="sel"></select>
+            </div>
+          </div>
+        </section>
+
+        <!-- STEP 4: Filter -->
+        <section class="step locked" id="step4">
+          <div class="step-header">
+            <span class="step-num">04</span>
+            <span class="step-title">Demographic Filter</span>
+          </div>
+          <div class="step-body">
+            <label class="field-label">Filter Combination</label>
+            <select id="selectFilter" class="sel"></select>
+          </div>
+        </section>
+
+      </div><!-- /sidebar-body -->
+    </aside>
+
+    <!-- ── MAIN PANEL ── -->
+    <main class="main-panel">
+
+      <div class="main-inner">
+
+        <!-- Empty state -->
+        <div class="empty-state" id="emptyState">
+          <div class="empty-icon">⬡</div>
+          <h2>Select your parameters</h2>
+          <p>Use the panel on the left to choose a measure, geography, year and demographic filter — then click <strong>Show Data</strong>.</p>
+        </div>
+
+        <!-- Loading state -->
+        <div class="loading-state hidden" id="loadingState">
+          <div class="loader-ring"></div>
+          <p class="loading-msg" id="loadingMsg">Preparing request…</p>
+        </div>
+
+        <!-- Error state -->
+        <div class="error-state hidden" id="errorState">
+          <div class="error-icon">!</div>
+          <p id="errorMsg">Something went wrong.</p>
+        </div>
+
+        <!-- Results -->
+        <div class="results hidden" id="results">
+
+          <div class="results-header">
+            <div class="results-meta" id="resultsMeta"></div>
+            <div class="results-actions">
+              <div class="view-toggle" id="viewToggle">
+                <button class="vt-btn active" data-view="full">Full Table</button>
+                <button class="vt-btn" data-view="summary">Summary</button>
+              </div>
+              <button class="dl-btn" id="btnDlCSV">↓ CSV</button>
+              <button class="dl-btn" id="btnDlXLSX">↓ Excel</button>
+            </div>
+          </div>
+
+          <!-- Summary filter -->
+          <div class="summary-bar hidden" id="summaryBar">
+            <div class="seg-control" id="summaryModeControl">
+              <button class="seg-btn active" data-value="max">Maximum</button>
+              <button class="seg-btn" data-value="min">Minimum</button>
+              <button class="seg-btn" data-value="geo">Specific Geography</button>
+            </div>
+            <div id="geoPickerWrap" class="hidden mt">
+              <select id="selectSummaryGeo" class="sel"></select>
+            </div>
+          </div>
+
+          <!-- Table container -->
+          <div class="table-wrap" id="tableWrap">
+            <table class="data-table" id="dataTable">
+              <thead id="tableHead"></thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+          </div>
+
+        </div><!-- /results -->
+
+      </div><!-- /main-inner -->
+    </main>
+
+  </div><!-- /app-shell -->
+
+  <!-- ── FIXED BOTTOM BAR ── -->
+  <div class="bottom-bar">
+    <div class="selection-pills" id="selectionPills"></div>
+    <button class="show-btn" id="btnShowData" disabled>Show Data</button>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
