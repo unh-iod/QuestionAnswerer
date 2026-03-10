@@ -85,11 +85,34 @@
         <section class="step locked" id="step4">
           <div class="step-header">
             <span class="step-num">04</span>
-            <span class="step-title">Demographic Filter</span>
+            <span class="step-title">Demographic Filters</span>
           </div>
           <div class="step-body">
-            <label class="field-label">Filter Combination</label>
-            <select id="selectFilter" class="sel"></select>
+
+            <!-- State/County shared: county uses legacy single dropdown -->
+            <div id="countyFilterWrap" class="hidden">
+              <label class="field-label">Filter Combination</label>
+              <select id="selectFilter" class="sel"></select>
+            </div>
+
+            <!-- State only: three independent dropdowns -->
+            <div id="stateFilterWrap">
+              <label class="field-label">Gender</label>
+              <select id="selectGender" class="sel"></select>
+
+              <label class="field-label mt">Race and Hispanic Origin</label>
+              <select id="selectRace" class="sel"></select>
+
+              <label class="field-label mt">Age Group</label>
+              <select id="selectAge" class="sel"></select>
+
+              <!-- Warning shown when Any/Any/Any is selected -->
+              <div id="filterWarning" class="filter-warning hidden">
+                ⚠ All three filters cannot be set to specific values simultaneously.
+                Set at least one filter to "All" to continue.
+              </div>
+            </div>
+
           </div>
         </section>
 

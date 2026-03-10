@@ -645,3 +645,17 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+/* ── Filter warning ───────────────────────────────────────────────────────── */
+.filter-warning {
+  margin-top: 12px;
+  padding: 9px 12px;
+  background: rgba(245, 200, 66, .1);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius);
+  color: var(--yellow);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  letter-spacing: .02em;
+}

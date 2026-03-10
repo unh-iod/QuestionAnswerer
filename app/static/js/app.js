@@ -7,20 +7,46 @@
 // ── State ────────────────────────────────────────────────────────────────────
 const S = {
   schema:      null,
-  geoLevel:    'state',      // 'state' | 'county'
+  geoLevel:    'state',
   disability:  null,
   measure:     null,
-  geos:        [],           // selected geography names
-  yearMode:    'single',     // 'single' | 'all'
+  geos:        [],
+  yearMode:    'single',
   year:        null,
+  // State-level filters (3 separate)
+  gender:      'All',
+  race:        'All',
+  age:         'All',
+  // County-level legacy filter
   filterI:     null,
-  tableData:   null,         // { columns, rows, geo_col }
+  // Derived
+  iIndex:      null,   // computed from gender/race/age for state; = filterI for county
+  filterValid: true,   // false when Any/Any/Any
+  tableData:   null,
   sortCol:     null,
   sortDir:     'asc',
-  viewMode:    'full',       // 'full' | 'summary'
-  summaryMode: 'max',        // 'max' | 'min' | 'geo'
+  viewMode:    'full',
+  summaryMode: 'max',
   summaryGeo:  null,
 };
+
+// i-index lookup matching server: (genderAny, raceAny, ageAny) -> i
+// Row 8 (true/true/true) is excluded
+const I_LOOKUP = {
+  'false|false|false': 1,
+  'false|false|true':  2,
+  'false|true|false':  3,
+  'false|true|true':   4,
+  'true|false|false':  5,
+  'true|false|true':   6,
+  'true|true|false':   7,
+  // true|true|true -> undefined (invalid)
+};
+
+function computeI(gender, race, age) {
+  const key = `${gender !== 'All'}|${race !== 'All'}|${age !== 'All'}`;
+  return I_LOOKUP[key] ?? null;  // null = invalid (Any/Any/Any)
+}
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -36,7 +62,7 @@ async function init() {
   updatePills();
 }
 
-// ── Step 1 builders ───────────────────────────────────────────────────────────
+// ── Step 1 ────────────────────────────────────────────────────────────────────
 function buildDisabilitySelect() {
   const sel = $('selectDisability');
   sel.innerHTML = S.schema.disability_types
@@ -60,8 +86,8 @@ function buildMeasureGrid() {
   Object.entries(groups).forEach(([grp, items]) => {
     html += `<div class="measure-group-label">${grp}</div>`;
     items.forEach(m => {
-      html += `<button class="measure-btn${S.measure === m.value ? ' selected' : ''}"
-                       data-value="${m.value}">${m.label}</button>`;
+      const sel = S.measure === m.value ? ' selected' : '';
+      html += `<button class="measure-btn${sel}" data-value="${m.value}">${m.label}</button>`;
     });
   });
   $('measureGroups').innerHTML = html;
@@ -79,77 +105,102 @@ function selectMeasure(val) {
   onMeasureOrGeoLevelChange();
 }
 
-// ── Step 2: geography list ────────────────────────────────────────────────────
+// ── Step 2 ────────────────────────────────────────────────────────────────────
 function buildGeoList(filter = '') {
-  const list = S.geoLevel === 'state'
-    ? S.schema.us_states
-    : [];                          // county list populated dynamically if needed
-
+  const list = S.geoLevel === 'state' ? S.schema.us_states : [];
   const lower = filter.toLowerCase();
   const filtered = list.filter(g => g.toLowerCase().includes(lower));
 
   $('geoList').innerHTML = filtered.map(g => {
     const checked = S.geos.includes(g);
     return `<label class="geo-item${checked ? ' checked' : ''}">
-      <input type="checkbox" value="${g}" ${checked ? 'checked' : ''} />
-      ${g}
+      <input type="checkbox" value="${g}" ${checked ? 'checked' : ''} />${g}
     </label>`;
   }).join('');
 
   $('geoList').querySelectorAll('input[type=checkbox]').forEach(cb => {
     cb.addEventListener('change', () => {
-      if (cb.checked) {
-        if (!S.geos.includes(cb.value)) S.geos.push(cb.value);
-      } else {
-        S.geos = S.geos.filter(g => g !== cb.value);
-      }
+      if (cb.checked) { if (!S.geos.includes(cb.value)) S.geos.push(cb.value); }
+      else             { S.geos = S.geos.filter(g => g !== cb.value); }
       cb.closest('.geo-item').classList.toggle('checked', cb.checked);
       onGeoSelectionChange();
     });
   });
 }
 
-// ── Step 3: year select ───────────────────────────────────────────────────────
+// ── Step 3 ────────────────────────────────────────────────────────────────────
 function buildYearSelect() {
-  const years = S.geoLevel === 'state'
-    ? S.schema.state_years
-    : S.schema.county_years;
-
+  const years = S.geoLevel === 'state' ? S.schema.state_years : S.schema.county_years;
   const sel = $('selectYear');
-  sel.innerHTML = [...years].reverse()
-    .map(y => `<option value="${y}">${y}</option>`)
-    .join('');
-
-  S.year = years[years.length - 1]; // default to most recent
+  sel.innerHTML = [...years].reverse().map(y => `<option value="${y}">${y}</option>`).join('');
+  S.year = years[years.length - 1];
   sel.value = S.year;
 }
 
-// ── Step 4: filter select ─────────────────────────────────────────────────────
-async function buildFilterSelect() {
-  let filters;
-  if (S.geoLevel === 'state') {
-    filters = S.schema.state_filters;
-  } else {
-    const res = await fetch(`/api/county_filters?measure=${S.measure}`);
-    const data = await res.json();
-    filters = data.filters;
-  }
+// ── Step 4 ────────────────────────────────────────────────────────────────────
+function buildStateFilters() {
+  // Gender
+  $('selectGender').innerHTML = S.schema.gender_options
+    .map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+  S.gender = 'All';
 
-  $('selectFilter').innerHTML = filters
-    .map(f => `<option value="${f.i}">${f.label}</option>`)
-    .join('');
+  // Race
+  $('selectRace').innerHTML = S.schema.race_options
+    .map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+  S.race = 'All';
 
-  S.filterI = filters[0].i;
+  // Age — options depend on measure
+  buildAgeSelect();
+
+  updateIIndex();
+}
+
+function buildAgeSelect() {
+  const ageGroupKey = S.schema.measure_age_group[S.measure] ?? 'population';
+  const options     = S.schema.age_groups[ageGroupKey] ?? S.schema.age_groups['population'];
+
+  $('selectAge').innerHTML = options
+    .map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+
+  // Reset age if current value not in new options
+  const vals = options.map(o => o.value);
+  if (!vals.includes(S.age)) S.age = 'All';
+  $('selectAge').value = S.age;
+}
+
+function updateIIndex() {
+  S.iIndex = computeI(S.gender, S.race, S.age);
+  S.filterValid = S.iIndex !== null;
+  $('filterWarning').classList.toggle('hidden', S.filterValid);
+  updatePills();
+  checkReadiness();
+}
+
+async function buildCountyFilterSelect() {
+  const res  = await fetch(`/api/county_filters?measure=${S.measure}`);
+  const data = await res.json();
+  $('selectFilter').innerHTML = data.filters
+    .map(f => `<option value="${f.i}">${f.label}</option>`).join('');
+  S.filterI = data.filters[0].i;
   $('selectFilter').value = S.filterI;
+}
+
+function showStateFilters() {
+  $('stateFilterWrap').classList.remove('hidden');
+  $('countyFilterWrap').classList.add('hidden');
+}
+
+function showCountyFilters() {
+  $('countyFilterWrap').classList.remove('hidden');
+  $('stateFilterWrap').classList.add('hidden');
 }
 
 // ── Wiring ────────────────────────────────────────────────────────────────────
 function wireControls() {
-  // Geo level segmented control
+  // Geo level
   document.querySelectorAll('#geoLevelControl .seg-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('#geoLevelControl .seg-btn')
-        .forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('#geoLevelControl .seg-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       S.geoLevel = btn.dataset.value;
       S.measure  = null;
@@ -158,7 +209,7 @@ function wireControls() {
     });
   });
 
-  // Disability select
+  // Disability
   $('selectDisability').addEventListener('change', e => {
     S.disability = e.target.value;
     updatePills();
@@ -168,8 +219,7 @@ function wireControls() {
   // Year mode
   document.querySelectorAll('#yearModeControl .seg-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('#yearModeControl .seg-btn')
-        .forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('#yearModeControl .seg-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       S.yearMode = btn.dataset.value;
       $('yearPickerWrap').classList.toggle('hidden', S.yearMode === 'all');
@@ -182,7 +232,21 @@ function wireControls() {
     onYearChange();
   });
 
-  // Filter select
+  // State filters
+  $('selectGender').addEventListener('change', e => {
+    S.gender = e.target.value;
+    updateIIndex();
+  });
+  $('selectRace').addEventListener('change', e => {
+    S.race = e.target.value;
+    updateIIndex();
+  });
+  $('selectAge').addEventListener('change', e => {
+    S.age = e.target.value;
+    updateIIndex();
+  });
+
+  // County legacy filter
   $('selectFilter').addEventListener('change', e => {
     S.filterI = parseInt(e.target.value);
     updatePills();
@@ -191,11 +255,8 @@ function wireControls() {
 
   // Geo search
   $('geoSearch').addEventListener('input', e => buildGeoList(e.target.value));
-
-  // Select all / clear
   $('btnSelectAll').addEventListener('click', () => {
-    const geos = S.geoLevel === 'state' ? S.schema.us_states : [];
-    S.geos = [...geos];
+    S.geos = S.geoLevel === 'state' ? [...S.schema.us_states] : [];
     buildGeoList($('geoSearch').value);
     onGeoSelectionChange();
   });
@@ -211,8 +272,7 @@ function wireControls() {
   // View toggle
   document.querySelectorAll('#viewToggle .vt-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('#viewToggle .vt-btn')
-        .forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('#viewToggle .vt-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       S.viewMode = btn.dataset.view;
       $('summaryBar').classList.toggle('hidden', S.viewMode === 'full');
@@ -223,8 +283,7 @@ function wireControls() {
   // Summary mode
   document.querySelectorAll('#summaryModeControl .seg-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('#summaryModeControl .seg-btn')
-        .forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('#summaryModeControl .seg-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       S.summaryMode = btn.dataset.value;
       $('geoPickerWrap').classList.toggle('hidden', S.summaryMode !== 'geo');
@@ -258,6 +317,8 @@ function onMeasureOrGeoLevelChange() {
   resetFromStep(2);
   buildGeoList();
   unlockStep(2);
+  // If state level, rebuild age options when measure changes
+  if (S.geoLevel === 'state') buildAgeSelect();
   updatePills();
   checkReadiness();
 }
@@ -265,7 +326,14 @@ function onMeasureOrGeoLevelChange() {
 function onGeoSelectionChange() {
   if (S.geos.length > 0) {
     unlockStep(3);
-    buildFilterSelect().then(() => unlockStep(4));
+    unlockStep(4);
+    if (S.geoLevel === 'state') {
+      showStateFilters();
+      buildStateFilters();
+    } else {
+      showCountyFilters();
+      buildCountyFilterSelect();
+    }
   } else {
     lockStep(3);
     lockStep(4);
@@ -283,9 +351,8 @@ function onYearChange() {
 function unlockStep(n) {
   const el = $(`step${n}`);
   el.classList.remove('locked');
-  // Trigger re-animation each time step is revealed
   el.classList.remove('unlocked');
-  void el.offsetWidth; // reflow
+  void el.offsetWidth;
   el.classList.add('unlocked');
 }
 
@@ -298,36 +365,44 @@ function lockStep(n) {
 function resetFromStep(n) {
   for (let i = n; i <= 4; i++) lockStep(i);
   if (n <= 3) { S.geos = []; buildGeoList(); }
-  if (n <= 4) { S.filterI = null; $('selectFilter').innerHTML = ''; }
+  if (n <= 4) {
+    S.filterI    = null;
+    S.gender     = 'All';
+    S.race       = 'All';
+    S.age        = 'All';
+    S.iIndex     = null;
+    S.filterValid = true;
+    $('filterWarning').classList.add('hidden');
+    $('selectFilter').innerHTML = '';
+  }
 }
 
 // ── Pills ─────────────────────────────────────────────────────────────────────
 function updatePills() {
-  const measures = S.geoLevel === 'state'
-    ? S.schema?.state_measures
-    : S.schema?.county_measures;
+  const measures   = S.geoLevel === 'state' ? S.schema?.state_measures : S.schema?.county_measures;
+  const mLabel     = measures?.find(m => m.value === S.measure)?.label ?? '—';
+  const dLabel     = S.schema?.disability_types.find(d => d.value === S.disability)?.label ?? '—';
+  const geoLabel   = S.geos.length ? (S.geos.length === 1 ? S.geos[0] : `${S.geos.length} geographies`) : '—';
+  const yearLabel  = S.yearMode === 'all' ? 'All years' : (S.year ? String(S.year) : '—');
 
-  const measureLabel = measures
-    ? (measures.find(m => m.value === S.measure)?.label ?? '—')
-    : '—';
-
-  const disabilityLabel = S.schema?.disability_types
-    .find(d => d.value === S.disability)?.label ?? '—';
-
-  const geoLabel = S.geos.length
-    ? (S.geos.length === 1 ? S.geos[0] : `${S.geos.length} geographies`)
-    : '—';
-
-  const yearLabel = S.yearMode === 'all'
-    ? 'All years'
-    : (S.year ? String(S.year) : '—');
+  let filterLabel = '—';
+  if (S.geoLevel === 'state' && S.iIndex !== null) {
+    const parts = [];
+    if (S.gender !== 'All') parts.push(S.gender);
+    if (S.race   !== 'All') parts.push(S.schema.race_options.find(r => r.value === S.race)?.label ?? S.race);
+    if (S.age    !== 'All') parts.push(S.schema.age_groups[S.schema.measure_age_group[S.measure]]?.find(a => a.value === S.age)?.label ?? S.age);
+    filterLabel = parts.length ? parts.join(' · ') : 'All';
+  } else if (S.geoLevel === 'county' && S.filterI) {
+    filterLabel = `i=${S.filterI}`;
+  }
 
   const pills = [
     { label: S.geoLevel === 'state' ? 'US/State' : 'County', active: true },
-    { label: disabilityLabel,  active: !!S.disability },
-    { label: measureLabel,     active: !!S.measure },
-    { label: geoLabel,         active: S.geos.length > 0 },
-    { label: yearLabel,        active: !!S.year || S.yearMode === 'all' },
+    { label: dLabel,       active: !!S.disability },
+    { label: mLabel,       active: !!S.measure },
+    { label: geoLabel,     active: S.geos.length > 0 },
+    { label: yearLabel,    active: !!S.year || S.yearMode === 'all' },
+    { label: filterLabel,  active: S.geoLevel === 'county' ? !!S.filterI : S.iIndex !== null },
   ];
 
   $('selectionPills').innerHTML = pills
@@ -336,8 +411,15 @@ function updatePills() {
 }
 
 function checkReadiness() {
-  const ready = S.disability && S.measure && S.geos.length > 0 &&
-    (S.yearMode === 'all' || S.year) && S.filterI != null;
+  let ready = S.disability && S.measure && S.geos.length > 0 &&
+              (S.yearMode === 'all' || S.year);
+
+  if (S.geoLevel === 'state') {
+    ready = ready && S.iIndex !== null && S.filterValid;
+  } else {
+    ready = ready && S.filterI != null;
+  }
+
   $('btnShowData').disabled = !ready;
 }
 
@@ -350,17 +432,26 @@ async function fetchData() {
   showLoading(`Loading 0 of ${years.length} file${years.length > 1 ? 's' : ''}…`);
 
   try {
+    const body = {
+      geo_level:   S.geoLevel,
+      geographies: S.geos,
+      measure:     S.measure,
+      disability:  S.disability,
+      years:       years,
+    };
+
+    if (S.geoLevel === 'state') {
+      body.gender = S.gender;
+      body.race   = S.race;
+      body.age    = S.age;
+    } else {
+      body.i = S.filterI;
+    }
+
     const res = await fetch('/api/data', {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        geo_level:   S.geoLevel,
-        geographies: S.geos,
-        measure:     S.measure,
-        disability:  S.disability,
-        years:       years,
-        i:           S.filterI,
-      }),
+      body:    JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -369,13 +460,8 @@ async function fetchData() {
       return;
     }
 
-    // Safely parse — R can emit bare NaN tokens which are invalid JSON.
-    // We scrub them from the raw text before parsing.
-    const rawText = await res.text();
-    const cleanText = rawText
-      .replace(/:NaN/g, ':null')
-      .replace(/:Inf/g, ':null')
-      .replace(/:-Inf/g, ':null');
+    const rawText   = await res.text();
+    const cleanText = rawText.replace(/:NaN/g, ':null').replace(/:Inf/g, ':null').replace(/:-Inf/g, ':null');
     let data;
     try {
       data = JSON.parse(cleanText);
@@ -383,15 +469,12 @@ async function fetchData() {
       showError('Could not parse server response: ' + parseErr.message);
       return;
     }
-    showLoading(`Loaded ${data.loaded_files} of ${data.total_files} files…`);
 
-    // Small delay so user sees the final count
+    showLoading(`Loaded ${data.loaded_files} of ${data.total_files} files…`);
     await new Promise(r => setTimeout(r, 400));
 
     S.tableData = data;
     S.sortCol   = null;
-
-    // Build geo picker for summary mode
     buildSummaryGeoPicker(data);
     showResults(data);
 
@@ -400,15 +483,12 @@ async function fetchData() {
   }
 }
 
-// ── Results rendering ─────────────────────────────────────────────────────────
+// ── Results ───────────────────────────────────────────────────────────────────
 function buildSummaryGeoPicker(data) {
   const geoCol = data.geo_col;
   if (!geoCol) return;
-
   const uniqueGeos = [...new Set(data.rows.map(r => r[geoCol]).filter(Boolean))].sort();
-  $('selectSummaryGeo').innerHTML = uniqueGeos
-    .map(g => `<option value="${g}">${g}</option>`)
-    .join('');
+  $('selectSummaryGeo').innerHTML = uniqueGeos.map(g => `<option value="${g}">${g}</option>`).join('');
   S.summaryGeo = uniqueGeos[0] ?? null;
 }
 
@@ -418,14 +498,13 @@ function showResults(data) {
   $('errorState').classList.add('hidden');
   $('results').classList.remove('hidden');
 
-  // Meta line
   const measures = S.geoLevel === 'state' ? S.schema.state_measures : S.schema.county_measures;
   const mLabel   = measures.find(m => m.value === S.measure)?.label ?? S.measure;
   const dLabel   = S.schema.disability_types.find(d => d.value === S.disability)?.label ?? S.disability;
 
   $('resultsMeta').innerHTML =
     `<strong>${mLabel}</strong> — ${dLabel} &nbsp;·&nbsp; ` +
-    `${S.geos.length} geography${S.geos.length > 1 ? 'ies' : ''} &nbsp;·&nbsp; ` +
+    `${S.geos.length} geography${S.geos.length !== 1 ? 'ies' : ''} &nbsp;·&nbsp; ` +
     `${S.yearMode === 'all' ? 'All years' : S.year} &nbsp;·&nbsp; ` +
     `${data.rows.length} rows loaded`;
 
@@ -438,18 +517,18 @@ function getDisplayRows() {
   let rows = [...S.tableData.rows];
 
   if (S.viewMode === 'summary' && S.tableData.geo_col) {
-    const geoCol = S.tableData.geo_col;
+    const geoCol     = S.tableData.geo_col;
     const numericCols = S.tableData.columns.filter(c => {
       const vals = rows.map(r => r[c]).filter(v => v != null);
       return vals.length > 0 && vals.every(v => !isNaN(Number(v)));
     });
 
     if (S.summaryMode === 'max' && numericCols.length > 0) {
-      const pivot = numericCols[0];
+      const pivot  = numericCols[0];
       const maxVal = Math.max(...rows.map(r => Number(r[pivot]) || -Infinity));
       rows = rows.filter(r => Number(r[pivot]) === maxVal);
     } else if (S.summaryMode === 'min' && numericCols.length > 0) {
-      const pivot = numericCols[0];
+      const pivot  = numericCols[0];
       const minVal = Math.min(...rows.map(r => Number(r[pivot]) || Infinity));
       rows = rows.filter(r => Number(r[pivot]) === minVal);
     } else if (S.summaryMode === 'geo' && S.summaryGeo) {
@@ -457,18 +536,16 @@ function getDisplayRows() {
     }
   }
 
-  // Sort
   if (S.sortCol != null) {
     const col = S.tableData.columns[S.sortCol];
     rows.sort((a, b) => {
       const av = a[col], bv = b[col];
       const an = Number(av), bn = Number(bv);
       const useNum = !isNaN(an) && !isNaN(bn);
-      const cmp = useNum ? an - bn : String(av ?? '').localeCompare(String(bv ?? ''));
+      const cmp    = useNum ? an - bn : String(av ?? '').localeCompare(String(bv ?? ''));
       return S.sortDir === 'asc' ? cmp : -cmp;
     });
   }
-
   return rows;
 }
 
@@ -480,44 +557,30 @@ function isNumericCol(colName) {
 
 function renderTable() {
   if (!S.tableData) return;
-
   const cols = S.tableData.columns;
   const rows = getDisplayRows();
 
-  // Header
   $('tableHead').innerHTML = `<tr>${cols.map((c, i) => {
-    let cls = '';
-    if (S.sortCol === i) cls = ` class="sort-${S.sortDir}"`;
+    const cls = S.sortCol === i ? ` class="sort-${S.sortDir}"` : '';
     return `<th${cls} data-col="${i}">${formatColName(c)}</th>`;
   }).join('')}</tr>`;
 
-  // Sort click
   $('tableHead').querySelectorAll('th').forEach(th => {
     th.addEventListener('click', () => {
       const idx = parseInt(th.dataset.col);
-      if (S.sortCol === idx) {
-        S.sortDir = S.sortDir === 'asc' ? 'desc' : 'asc';
-      } else {
-        S.sortCol = idx;
-        S.sortDir = 'asc';
-      }
+      S.sortDir = S.sortCol === idx ? (S.sortDir === 'asc' ? 'desc' : 'asc') : 'asc';
+      S.sortCol = idx;
       renderTable();
     });
   });
 
-  // Body
-  $('tableBody').innerHTML = rows.map(row => {
-    return `<tr>${cols.map(c => {
-      const v = row[c];
-      const num = isNumericCol(c);
-      const display = v == null ? '—' : (num ? fmtNum(v, c) : v);
-      return `<td class="${num ? 'numeric' : ''}">${display}</td>`;
-    }).join('')}</tr>`;
-  }).join('');
-
-  if (rows.length === 0) {
-    $('tableBody').innerHTML = `<tr><td colspan="${cols.length}" style="text-align:center;color:var(--text3);padding:24px;">No rows match the current filter.</td></tr>`;
-  }
+  $('tableBody').innerHTML = rows.length
+    ? rows.map(row => `<tr>${cols.map(c => {
+        const v   = row[c];
+        const num = isNumericCol(c);
+        return `<td class="${num ? 'numeric' : ''}">${v == null ? '—' : (num ? fmtNum(v, c) : v)}</td>`;
+      }).join('')}</tr>`).join('')
+    : `<tr><td colspan="${cols.length}" style="text-align:center;color:var(--text3);padding:24px;">No rows match the current filter.</td></tr>`;
 }
 
 function formatColName(col) {
@@ -527,21 +590,15 @@ function formatColName(col) {
 function fmtNum(v, col) {
   const n = Number(v);
   if (isNaN(n)) return v;
-  const colLower = col.toLowerCase();
-  // Percentages
-  if (colLower.includes('pct') || colLower.includes('percent') ||
-      colLower.includes('rate') || colLower.includes('ratio') ||
-      colLower.includes('prev')) {
+  const c = col.toLowerCase();
+  if (c.includes('pct') || c.includes('percent') || c.includes('rate') || c.includes('ratio') || c.includes('prev'))
     return n.toLocaleString(undefined, { maximumFractionDigits: 1 }) + '%';
-  }
-  // Large numbers
-  if (Math.abs(n) >= 1000) {
+  if (Math.abs(n) >= 1000)
     return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  }
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-// ── UI state helpers ──────────────────────────────────────────────────────────
+// ── UI helpers ────────────────────────────────────────────────────────────────
 function showLoading(msg) {
   $('emptyState').classList.add('hidden');
   $('results').classList.add('hidden');
@@ -561,7 +618,6 @@ function showError(msg) {
 // ── Downloads ─────────────────────────────────────────────────────────────────
 function downloadTable(format) {
   if (!S.tableData) return;
-
   const cols = S.tableData.columns;
   const rows = getDisplayRows();
 
@@ -574,52 +630,31 @@ function downloadTable(format) {
       }).join(','))
     ];
     triggerDownload(lines.join('\n'), 'data.csv', 'text/csv');
-
   } else if (format === 'xlsx') {
-    // Build a simple XLSX using only browser APIs (XML-based)
-    const xlsxContent = buildXLSX(cols, rows);
-    triggerDownload(xlsxContent, 'data.xlsx',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', true);
+    triggerDownload(buildXLSX(cols, rows), 'data.xlsx',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   }
 }
 
-function triggerDownload(content, filename, mimeType, isBinary = false) {
-  let blob;
-  if (isBinary) {
-    // content is a Uint8Array
-    blob = new Blob([content], { type: mimeType });
-  } else {
-    blob = new Blob([content], { type: mimeType });
-  }
-  const url = URL.createObjectURL(blob);
-  const a   = document.createElement('a');
-  a.href     = url;
-  a.download = filename;
-  a.click();
+function triggerDownload(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
 }
 
 function buildXLSX(cols, rows) {
-  // Minimal XLSX via SheetJS-compatible approach using a data URI trick
-  // We'll use the XML SpreadsheetML format (xls-compatible xlsx)
-  const escape = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-
-  let xml = `<?xml version="1.0"?>
-<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
- xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return `<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
 <Worksheet ss:Name="Data"><Table>
-<Row>${cols.map(c => `<Cell><Data ss:Type="String">${escape(c)}</Data></Cell>`).join('')}</Row>
-${rows.map(row =>
-  `<Row>${cols.map(c => {
-    const v = row[c];
-    const n = Number(v);
-    const type = (v != null && !isNaN(n)) ? 'Number' : 'String';
-    return `<Cell><Data ss:Type="${type}">${escape(v ?? '')}</Data></Cell>`;
-  }).join('')}</Row>`
-).join('\n')}
+<Row>${cols.map(c => `<Cell><Data ss:Type="String">${esc(c)}</Data></Cell>`).join('')}</Row>
+${rows.map(row => `<Row>${cols.map(c => {
+  const v = row[c], n = Number(v);
+  return `<Cell><Data ss:Type="${v != null && !isNaN(n) ? 'Number' : 'String'}">${esc(v ?? '')}</Data></Cell>`;
+}).join('')}</Row>`).join('\n')}
 </Table></Worksheet></Workbook>`;
-
-  return xml;
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

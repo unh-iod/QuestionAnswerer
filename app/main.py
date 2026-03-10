@@ -1,21 +1,19 @@
-from dotenv import load_dotenv
 import os
-import io
 import json
 import tempfile
 import logging
-from flask import Flask, jsonify, request, render_template, send_file
+import math
+from dotenv import load_dotenv
+load_dotenv()
+from flask import Flask, jsonify, request, render_template
 import pyreadr
 import pandas as pd
 import numpy as np
-import math
 from google.cloud import storage
 from google.oauth2 import service_account
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-load_dotenv()
 
 app = Flask(__name__)
 
@@ -49,7 +47,6 @@ STATE_MEASURES = [
     {"value": "AP",        "label": "All People",                          "group": "Population"},
     {"value": "APwD",      "label": "All People with Disabilities",        "group": "Population"},
     {"value": "EMP",       "label": "Employment-to-Population Ratio",      "group": "Economic"},
-    {"value": "EMP_age",   "label": "Employment Ratio by Age Group",       "group": "Economic"},
     {"value": "POVERTY",   "label": "Percent in Poverty",                  "group": "Economic"},
     {"value": "EARNINGS",  "label": "Full-Time Workers' Earnings",         "group": "Economic"},
     {"value": "VET",       "label": "Veteran Status",                      "group": "Social"},
@@ -77,17 +74,97 @@ COUNTY_MEASURES = [
 STATE_YEAR_RANGE  = list(range(2017, 2025))  # 2017–2024
 COUNTY_YEAR_RANGE = list(range(2012, 2025))  # 2012–2024
 
-# Filter combinations (i index) for US/State — 8 combinations
-STATE_FILTERS = [
-    {"i": 1, "label": "Gender: All  |  Race/Ethnicity: All  |  Age Group: All"},
-    {"i": 2, "label": "Gender: All  |  Race/Ethnicity: All  |  Age Group: Any"},
-    {"i": 3, "label": "Gender: All  |  Race/Ethnicity: Any  |  Age Group: All"},
-    {"i": 4, "label": "Gender: All  |  Race/Ethnicity: Any  |  Age Group: Any"},
-    {"i": 5, "label": "Gender: Any  |  Race/Ethnicity: All  |  Age Group: All"},
-    {"i": 6, "label": "Gender: Any  |  Race/Ethnicity: All  |  Age Group: Any"},
-    {"i": 7, "label": "Gender: Any  |  Race/Ethnicity: Any  |  Age Group: All"},
-    {"i": 8, "label": "Gender: Any  |  Race/Ethnicity: Any  |  Age Group: Any"},
+# Age group options per measure group
+AGE_GROUPS = {
+    "population": [
+        {"value": "All",              "label": "All"},
+        {"value": "Under5",           "label": "Under 5 Years"},
+        {"value": "5to17",            "label": "5 to 17 Years"},
+        {"value": "18to64",           "label": "18 to 64 Years"},
+        {"value": "65plus",           "label": "65 Years and Over"},
+    ],
+    "employment": [
+        {"value": "All",              "label": "All"},
+        {"value": "Under18",          "label": "Under 18 Years"},
+        {"value": "18to64",           "label": "18 to 64 Years"},
+        {"value": "18to24",           "label": "18 to 24 Years"},
+        {"value": "25to34",           "label": "25 to 34 Years"},
+        {"value": "35to44",           "label": "35 to 44 Years"},
+        {"value": "45to54",           "label": "45 to 54 Years"},
+        {"value": "55to64",           "label": "55 to 64 Years"},
+        {"value": "65plus",           "label": "65 Years and Over"},
+    ],
+    "earnings_poverty": [
+        {"value": "All",              "label": "All"},
+        {"value": "Under18",          "label": "Under 18 Years"},
+        {"value": "18to24",           "label": "18 to 24 Years"},
+        {"value": "25to34",           "label": "25 to 34 Years"},
+        {"value": "35to44",           "label": "35 to 44 Years"},
+        {"value": "45to54",           "label": "45 to 54 Years"},
+        {"value": "55to64",           "label": "55 to 64 Years"},
+        {"value": "65plus",           "label": "65 Years and Over"},
+    ],
+    "vet_insur": [
+        {"value": "All",              "label": "All"},
+        {"value": "Under5",           "label": "Under 5 Years"},
+        {"value": "5to17",            "label": "5 to 17 Years"},
+        {"value": "18to64",           "label": "18 to 64 Years"},
+        {"value": "65plus",           "label": "65 Years and Over"},
+    ],
+    "education": [
+        {"value": "All",              "label": "All"},
+        {"value": "25to34",           "label": "25 to 34 Years"},
+        {"value": "35to44",           "label": "35 to 44 Years"},
+        {"value": "45to54",           "label": "45 to 54 Years"},
+        {"value": "55to64",           "label": "55 to 64 Years"},
+        {"value": "65plus",           "label": "65 Years and Over"},
+    ],
+}
+
+# Map each measure to its age group set
+MEASURE_AGE_GROUP = {
+    "AP":        "population",
+    "APwD":      "population",
+    "EMP":       "employment",
+    "POVERTY":   "earnings_poverty",
+    "EARNINGS":  "earnings_poverty",
+    "VET":       "vet_insur",
+    "INSUR":     "vet_insur",
+    "LESSHS":    "education",
+    "HSGED":     "education",
+    "SOMECOL":   "education",
+    "COLLD":     "education",
+    "MOREC":     "education",
+    "COLLDMORE": "education",
+}
+
+GENDER_OPTIONS = [
+    {"value": "All",    "label": "All"},
+    {"value": "Female", "label": "Female"},
+    {"value": "Male",   "label": "Male"},
 ]
+
+RACE_OPTIONS = [
+    {"value": "All",                "label": "All"},
+    {"value": "Hispanic",           "label": "Hispanic"},
+    {"value": "NonHispanicAsian",   "label": "Non-Hispanic Asian"},
+    {"value": "NonHispanicBlack",   "label": "Non-Hispanic Black"},
+    {"value": "NonHispanicOther",   "label": "Non-Hispanic Other"},
+    {"value": "NonHispanicWhite",   "label": "Non-Hispanic White"},
+]
+
+# i-index lookup: (gender_is_any, race_is_any, age_is_any) -> i
+# Row order from spec (1-based), row 8 (Any/Any/Any) is excluded/invalid
+I_LOOKUP = {
+    (False, False, False): 1,
+    (False, False, True):  2,
+    (False, True,  False): 3,
+    (False, True,  True):  4,
+    (True,  False, False): 5,
+    (True,  False, True):  6,
+    (True,  True,  False): 7,
+    # (True, True, True) = 8 is excluded
+}
 
 # County filter combinations vary by measure
 COUNTY_FILTERS_PREV = [
@@ -126,6 +203,23 @@ def get_county_filters(measure):
         return COUNTY_FILTERS_TWO
     else:  # EDUC, E2PR, UNEMP
         return COUNTY_FILTERS_ONE
+
+def compute_i(gender, race, age):
+    """Compute i index from filter selections. Returns None if Any/Any/Any."""
+    g_any = gender != "All"
+    r_any = race   != "All"
+    a_any = age    != "All"
+    return I_LOOKUP.get((g_any, r_any, a_any))  # None if (True,True,True)
+
+def resolve_measure_and_suffix(measure, age):
+    """
+    For EMP: if age == "18to64", use EMP_age filename suffix.
+    Returns actual measure string to use in filename.
+    """
+    if measure == "EMP" and age == "18to64":
+        return "EMP_age"
+    return measure
+
 
 def build_filename(year, i, disability, measure, geo_level):
     suffix = "_COUNTY" if geo_level == "county" else ""
@@ -172,6 +266,22 @@ def blob_exists(blob_name):
     except Exception:
         return False
 
+    # Robustly replace all NaN/Inf variants with None for JSON serialisation.
+    # pd.notnull misses some R nan values that survive as float('nan'),
+    # so we sanitize every value explicitly.
+def sanitize(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    if isinstance(v, (np.floating,)) and (np.isnan(v) or np.isinf(v)):
+        return None
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    return v
+
 # ── API routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -182,13 +292,16 @@ def index():
 def api_schema():
     """Return full schema for the frontend to build dropdowns."""
     return jsonify({
-        "disability_types": DISABILITY_TYPES,
-        "state_measures":   STATE_MEASURES,
-        "county_measures":  COUNTY_MEASURES,
-        "state_years":      STATE_YEAR_RANGE,
-        "county_years":     COUNTY_YEAR_RANGE,
-        "state_filters":    STATE_FILTERS,
-        "us_states":        US_STATES,
+        "disability_types":  DISABILITY_TYPES,
+        "state_measures":    STATE_MEASURES,
+        "county_measures":   COUNTY_MEASURES,
+        "state_years":       STATE_YEAR_RANGE,
+        "county_years":      COUNTY_YEAR_RANGE,
+        "gender_options":    GENDER_OPTIONS,
+        "race_options":      RACE_OPTIONS,
+        "age_groups":        AGE_GROUPS,
+        "measure_age_group": MEASURE_AGE_GROUP,
+        "us_states":         US_STATES,
     })
 
 @app.route("/api/county_filters")
@@ -214,13 +327,24 @@ def api_data():
     measure    = body.get("measure")
     disability = body.get("disability")
     years      = body.get("years", [])
-    i          = body.get("i", 1)
+    gender     = body.get("gender", "All")
+    race       = body.get("race",   "All")
+    age        = body.get("age",    "All")
+    i          = body.get("i")          # county only
+
+    if geo_level == "state":
+        i = compute_i(gender, race, age)
+        if i is None:
+            return jsonify({"error": "Invalid filter combination: all three filters cannot be specific values simultaneously."}), 400
+        actual_measure = resolve_measure_and_suffix(measure, age)
+    else:
+        actual_measure = measure
 
     frames = []
     total  = len(years)
 
     for idx, year in enumerate(years):
-        fname = build_filename(year, i, disability, measure, geo_level)
+        fname = build_filename(year, i, disability, actual_measure, geo_level)
         logger.info(f"Fetching {fname} ({idx+1}/{total})")
         try:
             df = fetch_rds_from_gcs(fname)
@@ -245,22 +369,6 @@ def api_data():
     if geo_col and geos and "All" not in geos:
         combined = combined[combined[geo_col].isin(geos)]
 
-    # Robustly replace all NaN/Inf variants with None for JSON serialisation.
-    # pd.notnull misses some R nan values that survive as float('nan'),
-    # so we sanitize every value explicitly.
-    def sanitize(v):
-        if v is None:
-            return None
-        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-            return None
-        if isinstance(v, (np.floating,)) and (np.isnan(v) or np.isinf(v)):
-            return None
-        if isinstance(v, (np.integer,)):
-            return int(v)
-        if isinstance(v, (np.bool_,)):
-            return bool(v)
-        return v
-
     rows = [
         {k: sanitize(v) for k, v in row.items()}
         for row in combined.to_dict(orient="records")
@@ -282,11 +390,20 @@ def api_check_files():
     measure    = body.get("measure")
     disability = body.get("disability")
     years      = body.get("years", [])
-    i          = body.get("i", 1)
-
+    gender     = body.get("gender", "All")
+    race       = body.get("race",   "All")
+    age        = body.get("age",    "All")
+    i          = body.get("i")          # county only
     results = {}
+    if geo_level == "state":
+        i = compute_i(gender, race, age)
+        if i is None:
+            return jsonify({"error": "Invalid filter combination: all three filters cannot be specific values simultaneously."}), 400
+        actual_measure = resolve_measure_and_suffix(measure, age)
+    else:
+        actual_measure = measure
     for year in years:
-        fname = build_filename(year, i, disability, measure, geo_level)
+        fname = build_filename(year, i, disability, actual_measure, geo_level)
         results[year] = blob_exists(fname)
     return jsonify(results)
 
