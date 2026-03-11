@@ -106,23 +106,56 @@ function selectMeasure(val) {
 }
 
 // ── Step 2 ────────────────────────────────────────────────────────────────────
-function buildGeoList(filter = '') {
-  const list = S.geoLevel === 'state' ? S.schema.us_states : [];
-  const lower = filter.toLowerCase();
-  const filtered = list.filter(g => g.toLowerCase().includes(lower));
+// Debounce timer for county search
+let _geoSearchTimer = null;
 
-  $('geoList').innerHTML = filtered.map(g => {
+function buildGeoList(filter = '') {
+  const isCounty = S.geoLevel === 'county';
+  const fullList = isCounty ? (S.schema.us_counties ?? []) : S.schema.us_states;
+
+  // Hide Select All for county, show for state
+  $('btnSelectAll').classList.toggle('hidden', isCounty);
+
+  const lower    = filter.toLowerCase().trim();
+  const filtered = lower
+    ? fullList.filter(g => g.toLowerCase().includes(lower))
+    : fullList;
+
+  // For counties: cap visible rows at 50; for states: show all (~52, always fine)
+  const MAX_VISIBLE = isCounty ? 50 : fullList.length;
+  const visible     = filtered.slice(0, MAX_VISIBLE);
+  const totalMatch  = filtered.length;
+  const selectedOut = S.geos.filter(g => !visible.includes(g)).length;
+
+  // Build count badge
+  let badge = '';
+  if (isCounty) {
+    const parts = [];
+    if (totalMatch > MAX_VISIBLE)
+      parts.push(`Showing ${MAX_VISIBLE} of ${totalMatch.toLocaleString()} matches — type to narrow`);
+    if (selectedOut > 0)
+      parts.push(`+ ${selectedOut} selected outside this view`);
+    if (parts.length)
+      badge = `<div class="geo-badge">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
+  }
+
+  const items = visible.map(g => {
     const checked = S.geos.includes(g);
     return `<label class="geo-item${checked ? ' checked' : ''}">
       <input type="checkbox" value="${g}" ${checked ? 'checked' : ''} />${g}
     </label>`;
   }).join('');
 
+  $('geoList').innerHTML = badge + items;
+
   $('geoList').querySelectorAll('input[type=checkbox]').forEach(cb => {
     cb.addEventListener('change', () => {
       if (cb.checked) { if (!S.geos.includes(cb.value)) S.geos.push(cb.value); }
       else             { S.geos = S.geos.filter(g => g !== cb.value); }
       cb.closest('.geo-item').classList.toggle('checked', cb.checked);
+      // Refresh badge counts without re-filtering (pass current search term)
+      const term = $('geoSearch').value;
+      buildGeoList(term);
       onGeoSelectionChange();
     });
   });
@@ -253,16 +286,26 @@ function wireControls() {
     checkReadiness();
   });
 
-  // Geo search
-  $('geoSearch').addEventListener('input', e => buildGeoList(e.target.value));
+  // Geo search — debounced for county (large list), immediate for state
+  $('geoSearch').addEventListener('input', e => {
+    const val = e.target.value;
+    if (S.geoLevel === 'county') {
+      clearTimeout(_geoSearchTimer);
+      _geoSearchTimer = setTimeout(() => buildGeoList(val), 200);
+    } else {
+      buildGeoList(val);
+    }
+  });
   $('btnSelectAll').addEventListener('click', () => {
-    S.geos = S.geoLevel === 'state' ? [...S.schema.us_states] : [];
+    // Button is hidden for county, so this only ever fires for state
+    S.geos = [...S.schema.us_states];
     buildGeoList($('geoSearch').value);
     onGeoSelectionChange();
   });
   $('btnClearAll').addEventListener('click', () => {
     S.geos = [];
-    buildGeoList($('geoSearch').value);
+    $('geoSearch').value = '';          // clear search term so default list reappears
+    buildGeoList('');
     onGeoSelectionChange();
   });
 
@@ -305,19 +348,22 @@ function wireControls() {
 function onGeoLevelChange() {
   S.measure = null;
   S.geos    = [];
-  buildMeasureGrid();
-  buildYearSelect();
-  buildGeoList();
-  resetFromStep(2);
+  resetFromStep(2);   // lock steps 2-4 and clear downstream state
+  buildMeasureGrid(); // rebuild measure buttons for new geo level
+  buildYearSelect();  // rebuild year range for new geo level
+  buildGeoList();     // reset geo list (county list is empty until implemented)
   updatePills();
   checkReadiness();
 }
 
 function onMeasureOrGeoLevelChange() {
-  resetFromStep(2);
+  resetFromStep(2);   // locks steps 2-4, clears geos + filter state
+  // Hide both filter panels — they will be re-shown correctly when geo is selected
+  $('stateFilterWrap').classList.add('hidden');
+  $('countyFilterWrap').classList.add('hidden');
   buildGeoList();
   unlockStep(2);
-  // If state level, rebuild age options when measure changes
+  // Pre-build age select so the correct options are ready when step 4 unlocks
   if (S.geoLevel === 'state') buildAgeSelect();
   updatePills();
   checkReadiness();
@@ -329,14 +375,17 @@ function onGeoSelectionChange() {
     unlockStep(4);
     if (S.geoLevel === 'state') {
       showStateFilters();
-      buildStateFilters();
+      buildStateFilters();  // populates gender/race/age dropdowns, resets to All
     } else {
       showCountyFilters();
-      buildCountyFilterSelect();
+      buildCountyFilterSelect();  // fetches county filter options from API
     }
   } else {
     lockStep(3);
     lockStep(4);
+    // Hide both filter panels so neither shows stale content when step 4 re-locks
+    $('stateFilterWrap').classList.add('hidden');
+    $('countyFilterWrap').classList.add('hidden');
   }
   updatePills();
   checkReadiness();
@@ -659,3 +708,254 @@ ${rows.map(row => `<Row>${cols.map(c => {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', init);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CHAT PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+
+const Chat = {
+  history:        [],   // [{role:'user'|'assistant', content:'...'}]
+  awaitingFetch:  false // true after assistant asks "Shall I load data now?"
+};
+
+// ── Boot chat ─────────────────────────────────────────────────────────────────
+function initChat() {
+  $('chatToggle').addEventListener('click', () => {
+    $('chatPanel').classList.toggle('collapsed');
+  });
+
+  $('chatSend').addEventListener('click', sendChatMessage);
+
+  $('chatClear').addEventListener('click', () => {
+    Chat.history      = [];
+    Chat.awaitingFetch = false;
+    $('chatHistory').innerHTML = `<div class="chat-bubble assistant">
+      Chat cleared. How can I help you update the filters?
+    </div>`;
+  });
+
+  $('chatInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+}
+
+// ── Collect current sidebar state to send as context ─────────────────────────
+function getCurrentState() {
+  return {
+    geo_level:   S.geoLevel,
+    disability:  S.disability,
+    measure:     S.measure,
+    geographies: S.geos,
+    year_mode:   S.yearMode,
+    year:        S.year,
+    gender:      S.gender,
+    race:        S.race,
+    age:         S.age,
+  };
+}
+
+// ── Send message ──────────────────────────────────────────────────────────────
+async function sendChatMessage() {
+  const input = $('chatInput');
+  const text  = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  $('chatSend').disabled = true;
+
+  appendBubble('user', text);
+  Chat.history.push({ role: 'user', content: text });
+
+  // If we were awaiting a fetch confirmation, check for affirmative first
+  if (Chat.awaitingFetch && isAffirmative(text)) {
+    Chat.awaitingFetch = false;
+    appendBubble('assistant', 'Loading data now…');
+    Chat.history.push({ role: 'assistant', content: 'Loading data now…' });
+    $('chatSend').disabled = false;
+    fetchData();
+    return;
+  }
+
+  // Show thinking indicator
+  const thinkingId = appendBubble('thinking', '…');
+
+  try {
+    const res = await fetch('/api/chat', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message:       text,
+        history:       Chat.history.slice(-10), // last 10 turns for context window
+        current_state: getCurrentState(),
+      }),
+    });
+
+    removeBubble(thinkingId);
+
+    if (!res.ok) {
+      const err = await res.json();
+      appendBubble('assistant', `Sorry, something went wrong: ${err.error}`);
+      $('chatSend').disabled = false;
+      return;
+    }
+
+    const data = await res.json();
+
+    // Apply any validated updates to sidebar state
+    if (data.updates && Object.keys(data.updates).length > 0) {
+      applyUpdates(data.updates);
+    }
+
+    // Show reply with update tags
+    const tags = data.updates ? buildUpdateTags(data.updates) : '';
+    appendBubble('assistant', data.reply + (tags ? `<div>${tags}</div>` : ''));
+    Chat.history.push({ role: 'assistant', content: data.reply });
+
+    // Handle trigger_fetch (user already confirmed)
+    if (data.trigger_fetch) {
+      Chat.awaitingFetch = false;
+      setTimeout(() => fetchData(), 300);
+    } else if (data.reply.toLowerCase().includes('shall i load')) {
+      Chat.awaitingFetch = true;
+    }
+
+  } catch (e) {
+    removeBubble(thinkingId);
+    appendBubble('assistant', `Network error: ${e.message}`);
+  }
+
+  $('chatSend').disabled = false;
+}
+
+// ── Apply updates from LLM response to sidebar state ─────────────────────────
+function applyUpdates(updates) {
+  let geoLevelChanged  = false;
+  let measureChanged   = false;
+  let geosChanged      = false;
+
+  if ('geo_level' in updates && updates.geo_level !== S.geoLevel) {
+    S.geoLevel = updates.geo_level;
+    geoLevelChanged = true;
+    // Update segmented control UI
+    document.querySelectorAll('#geoLevelControl .seg-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.value === S.geoLevel);
+    });
+  }
+
+  if ('disability' in updates) {
+    S.disability = updates.disability;
+    $('selectDisability').value = S.disability;
+  }
+
+  if ('measure' in updates && updates.measure !== S.measure) {
+    S.measure = updates.measure;
+    measureChanged = true;
+  }
+
+  if ('geographies' in updates) {
+    S.geos = updates.geographies;
+    geosChanged = true;
+  }
+
+  if ('year_mode' in updates) {
+    S.yearMode = updates.year_mode;
+    document.querySelectorAll('#yearModeControl .seg-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.value === S.yearMode);
+    });
+    $('yearPickerWrap').classList.toggle('hidden', S.yearMode === 'all');
+  }
+
+  if ('year' in updates) {
+    S.year = updates.year;
+    $('selectYear').value = S.year;
+  }
+
+  if ('gender' in updates) { S.gender = updates.gender; if ($('selectGender')) $('selectGender').value = S.gender; }
+  if ('race'   in updates) { S.race   = updates.race;   if ($('selectRace'))   $('selectRace').value   = S.race;   }
+  if ('age'    in updates) { S.age    = updates.age;    if ($('selectAge'))     $('selectAge').value    = S.age;    }
+
+  // Rebuild dependent UI
+  if (geoLevelChanged || measureChanged) {
+    buildMeasureGrid();
+    buildYearSelect();
+    // Re-highlight selected measure button
+    document.querySelectorAll('.measure-btn').forEach(b => {
+      b.classList.toggle('selected', b.dataset.value === S.measure);
+    });
+  }
+
+  if (geoLevelChanged || measureChanged || geosChanged) {
+    buildGeoList($('geoSearch').value);
+
+    // Unlock steps as appropriate
+    if (S.measure) unlockStep(2);
+    if (S.geos.length > 0) {
+      unlockStep(3);
+      unlockStep(4);
+      if (S.geoLevel === 'state') {
+        showStateFilters();
+        buildAgeSelect();   // rebuild age options for new measure
+        if ($('selectGender')) $('selectGender').value = S.gender;
+        if ($('selectRace'))   $('selectRace').value   = S.race;
+        if ($('selectAge'))    $('selectAge').value     = S.age;
+      } else {
+        showCountyFilters();
+        buildCountyFilterSelect();
+      }
+    }
+  }
+
+  // Recompute i-index and readiness
+  if (S.geoLevel === 'state') updateIIndex();
+  updatePills();
+  checkReadiness();
+}
+
+// ── Build update tags (small green badges) ────────────────────────────────────
+function buildUpdateTags(updates) {
+  const LABELS = {
+    geo_level:   v => v === 'state' ? 'Level → US/State' : 'Level → County',
+    disability:  v => `Disability → ${v}`,
+    measure:     v => `Measure → ${v}`,
+    geographies: v => `Geographies → ${v.length} selected`,
+    year_mode:   v => `Year mode → ${v}`,
+    year:        v => `Year → ${v}`,
+    gender:      v => `Gender → ${v}`,
+    race:        v => `Race → ${v}`,
+    age:         v => `Age → ${v}`,
+  };
+  return Object.entries(updates)
+    .map(([k, v]) => LABELS[k] ? `<span class="update-tag">${LABELS[k](v)}</span>` : '')
+    .join('');
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────────
+let _bubbleCounter = 0;
+
+function appendBubble(role, html) {
+  const id  = `bubble-${++_bubbleCounter}`;
+  const div = document.createElement('div');
+  div.id        = id;
+  div.className = `chat-bubble ${role}`;
+  div.innerHTML = html;
+  $('chatHistory').appendChild(div);
+  $('chatHistory').scrollTop = $('chatHistory').scrollHeight;
+  return id;
+}
+
+function removeBubble(id) {
+  const el = $(id);
+  if (el) el.remove();
+}
+
+// ── Affirmative detection ─────────────────────────────────────────────────────
+function isAffirmative(text) {
+  return /^(yes|yep|yeah|sure|ok|okay|go|load|do it|please|yup|absolutely|confirm)[\s!.]*$/i.test(text.trim());
+}
+
+// Hook into existing init
+const _origInit = init;
+window.addEventListener('DOMContentLoaded', initChat);

@@ -122,6 +122,37 @@
     <!-- ── MAIN PANEL ── -->
     <main class="main-panel">
 
+      <!-- ── TOP CHAT BAR ── -->
+      <div class="chat-panel" id="chatPanel">
+
+        <div class="chat-header" id="chatToggle">
+          <span class="chat-title">
+            <span class="chat-icon">⬡</span> Filter Assistant
+          </span>
+          <span class="chat-chevron" id="chatChevron">▼</span>
+        </div>
+
+        <div class="chat-body" id="chatBody">
+          <div class="chat-history" id="chatHistory">
+            <div class="chat-bubble assistant">
+              Hi! I can help you update the data filters using plain English.
+              Try something like <em>"Show employment data for California, 2022"</em>
+              or <em>"Filter to Hispanic women aged 18 to 64."</em>
+            </div>
+          </div>
+
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" class="chat-input"
+                   placeholder="Ask me to update filters…" autocomplete="off" />
+            <div class="chat-input-actions">
+              <button class="chat-send" id="chatSend">Send</button>
+              <button class="chat-clear" id="chatClear">Clear</button>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /chat-panel -->
+
       <div class="main-inner">
 
         <!-- Empty state -->
@@ -190,6 +221,7 @@
     <div class="selection-pills" id="selectionPills"></div>
     <button class="show-btn" id="btnShowData" disabled>Show Data</button>
   </div>
+
 
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>

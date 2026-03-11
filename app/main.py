@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from google.cloud import storage
 from google.oauth2 import service_account
+import anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ COUNTY_FILTERS_ONE = [
 ]
 
 US_STATES = [
-    "United States", "Alabama", "Alaska", "Arizona", "Arkansas", "California",
+    "U.S.", "Alabama", "Alaska", "Arizona", "Arkansas", "California",
     "Colorado", "Connecticut", "Delaware", "District of Columbia", "Florida",
     "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas",
     "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan",
@@ -193,6 +194,9 @@ US_STATES = [
     "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin",
     "Wyoming",
 ]
+
+US_COUNTIES = pd.read_csv('counties.csv')['x'].to_list()
+
 
 # ── Helper functions ───────────────────────────────────────────────────────────
 
@@ -302,6 +306,7 @@ def api_schema():
         "age_groups":        AGE_GROUPS,
         "measure_age_group": MEASURE_AGE_GROUP,
         "us_states":         US_STATES,
+        "us_counties":       US_COUNTIES
     })
 
 @app.route("/api/county_filters")
@@ -361,13 +366,16 @@ def api_data():
     # Detect geography column (first string column that looks like state/county names)
     geo_col = None
     for col in combined.columns:
-        if col.lower() in ("state", "county", "geography", "geo", "name", "geoid", "fips"):
+        if col in ("ST_text", "Geographic.Area.Name"):
             geo_col = col
             break
 
+    print(combined)
+    print(geo_col,geos)
     # Filter to selected geographies if a geo column was found and geos requested
     if geo_col and geos and "All" not in geos:
-        combined = combined[combined[geo_col].isin(geos)]
+        pattern = '|'.join(geos)
+        combined = combined[combined[geo_col].str.contains(pattern)]
 
     rows = [
         {k: sanitize(v) for k, v in row.items()}
@@ -406,6 +414,247 @@ def api_check_files():
         fname = build_filename(year, i, disability, actual_measure, geo_level)
         results[year] = blob_exists(fname)
     return jsonify(results)
+
+# ── Chat endpoint ──────────────────────────────────────────────────────────────
+
+CHAT_SYSTEM_PROMPT = """You are a filter selection assistant embedded in an ACS (American Community Survey) \
+disability statistics explorer application. Your ONLY job is to help users update the sidebar filter \
+selections by interpreting their natural language requests.
+
+You have access to the full data schema and the user's current selections (provided in each message).
+
+RULES:
+1. You may only update filter values that exist in the schema provided. Never invent values.
+2. If the user's intent is ambiguous or a required piece of information is missing, ask ONE clear \
+   clarifying question. Do not guess.
+3. After applying updates, always end your reply with exactly: "Shall I load the data now?"
+4. If the user says yes/yep/sure/load/go/do it (or any clear affirmative) in response to that question, \
+   set "trigger_fetch": true in your response and do NOT set any updates.
+5. If nothing needs to change (e.g. the user asks a question you can't answer via filters), \
+   explain your limitations politely. Do not set trigger_fetch or updates.
+6. Respond in JSON only — no markdown fences, no preamble. Schema:
+{
+  "reply": "<conversational response to show the user>",
+  "updates": {
+    // Include ONLY fields that should change. Omit fields that stay the same.
+    // Valid keys and value types:
+    "geo_level":   "state" | "county",
+    "disability":  "<disability value from schema>",
+    "measure":     "<measure value from schema>",
+    "geographies": ["<geo name>", ...],   // full replacement list
+    "year_mode":   "single" | "all",
+    "year":        <integer>,
+    "gender":      "<gender value from schema>",
+    "race":        "<race value from schema>",
+    "age":         "<age value from schema>"
+  },
+  "trigger_fetch": false   // set true ONLY when user explicitly confirms they want to load data
+}
+"""
+
+def build_chat_context(current_state, schema):
+    """Build a context block describing current selections and full schema."""
+    lines = ["=== CURRENT SELECTIONS ==="]
+    lines.append(f"Geographic level: {current_state.get('geo_level', 'state')}")
+    lines.append(f"Disability type:  {current_state.get('disability', 'not set')}")
+    lines.append(f"Measure:          {current_state.get('measure', 'not set')}")
+    lines.append(f"Geographies:      {', '.join(current_state.get('geographies', [])) or 'none selected'}")
+    lines.append(f"Year mode:        {current_state.get('year_mode', 'single')}")
+    lines.append(f"Year:             {current_state.get('year', 'not set')}")
+    lines.append(f"Gender:           {current_state.get('gender', 'All')}")
+    lines.append(f"Race/ethnicity:   {current_state.get('race', 'All')}")
+    lines.append(f"Age group:        {current_state.get('age', 'All')}")
+
+    lines.append("\n=== AVAILABLE SCHEMA ===")
+
+    lines.append("\nDisability types:")
+    for d in schema.get("disability_types", []):
+        lines.append(f"  value={d['value']}  label={d['label']}")
+
+    lines.append("\nUS/State measures:")
+    for m in schema.get("state_measures", []):
+        lines.append(f"  value={m['value']}  label={m['label']}  group={m['group']}")
+
+    lines.append("\nCounty measures:")
+    for m in schema.get("county_measures", []):
+        lines.append(f"  value={m['value']}  label={m['label']}  group={m['group']}")
+
+    lines.append(f"\nUS/State year range: {schema.get('state_years', [])[0]} - {schema.get('state_years', [])[-1]}")
+    lines.append(f"County year range:   {schema.get('county_years', [])[0]} - {schema.get('county_years', [])[-1]}")
+
+    lines.append("\nGender options:")
+    for g in schema.get("gender_options", []):
+        lines.append(f"  value={g['value']}  label={g['label']}")
+
+    lines.append("\nRace/ethnicity options:")
+    for r in schema.get("race_options", []):
+        lines.append(f"  value={r['value']}  label={r['label']}")
+
+    lines.append("\nAge group sets (vary by measure):")
+    for group_key, options in schema.get("age_groups", {}).items():
+        labels = ", ".join(o["value"] for o in options)
+        lines.append(f"  {group_key}: {labels}")
+
+    lines.append("\nMeasure -> age group mapping:")
+    for measure, ag in schema.get("measure_age_group", {}).items():
+        lines.append(f"  {measure} -> {ag}")
+
+    lines.append("\nNote: geographies must be exact strings from us_states or us_counties lists.")
+    lines.append("Geography names are formatted as 'County Name, ST' for counties.")
+
+    return "\n".join(lines)
+
+def validate_updates(updates, schema):
+    """
+    Validate and sanitize LLM-proposed updates against the schema.
+    Returns a cleaned updates dict with only valid values.
+    """
+    if not updates:
+        return {}
+
+    clean = {}
+
+    # geo_level
+    if "geo_level" in updates and updates["geo_level"] in ("state", "county"):
+        clean["geo_level"] = updates["geo_level"]
+
+    # disability
+    valid_disabilities = {d["value"] for d in schema["disability_types"]}
+    if "disability" in updates and updates["disability"] in valid_disabilities:
+        clean["disability"] = updates["disability"]
+
+    # measure — valid set depends on geo_level in updates or current
+    valid_state   = {m["value"] for m in schema["state_measures"]}
+    valid_county  = {m["value"] for m in schema["county_measures"]}
+    valid_measures = valid_state | valid_county
+    if "measure" in updates and updates["measure"] in valid_measures:
+        clean["measure"] = updates["measure"]
+
+    # geographies — validate each against known lists
+    if "geographies" in updates and isinstance(updates["geographies"], list):
+        valid_geos = set(schema.get("us_states", [])) | set(schema.get("us_counties", []))
+        validated_geos = [g for g in updates["geographies"] if g in valid_geos]
+        if validated_geos:
+            clean["geographies"] = validated_geos
+
+    # year_mode
+    if "year_mode" in updates and updates["year_mode"] in ("single", "all"):
+        clean["year_mode"] = updates["year_mode"]
+
+    # year — must be integer within either year range
+    if "year" in updates:
+        try:
+            yr = int(updates["year"])
+            all_years = set(schema["state_years"]) | set(schema["county_years"])
+            if yr in all_years:
+                clean["year"] = yr
+        except (TypeError, ValueError):
+            pass
+
+    # gender
+    valid_genders = {g["value"] for g in schema["gender_options"]}
+    if "gender" in updates and updates["gender"] in valid_genders:
+        clean["gender"] = updates["gender"]
+
+    # race
+    valid_races = {r["value"] for r in schema["race_options"]}
+    if "race" in updates and updates["race"] in valid_races:
+        clean["race"] = updates["race"]
+
+    # age — valid values are union of all age group sets
+    valid_ages = set()
+    for group in schema.get("age_groups", {}).values():
+        for o in group:
+            valid_ages.add(o["value"])
+    if "age" in updates and updates["age"] in valid_ages:
+        clean["age"] = updates["age"]
+
+    return clean
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """
+    Process a chat message and return filter update instructions.
+    Body JSON:
+      message       : str   — user's message
+      history       : list  — [{role, content}, ...] previous turns
+      current_state : dict  — current sidebar selections
+    """
+    body          = request.get_json()
+    user_message  = body.get("message", "").strip()
+    history       = body.get("history", [])
+    current_state = body.get("current_state", {})
+
+    if not user_message:
+        return jsonify({"error": "Empty message."}), 400
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return jsonify({"error": "ANTHROPIC_API_KEY not configured."}), 500
+
+    # Build schema dict for context (reuse existing constants)
+    schema = {
+        "disability_types":  DISABILITY_TYPES,
+        "state_measures":    STATE_MEASURES,
+        "county_measures":   COUNTY_MEASURES,
+        "state_years":       STATE_YEAR_RANGE,
+        "county_years":      COUNTY_YEAR_RANGE,
+        "gender_options":    GENDER_OPTIONS,
+        "race_options":      RACE_OPTIONS,
+        "age_groups":        AGE_GROUPS,
+        "measure_age_group": MEASURE_AGE_GROUP,
+        "us_states":         US_STATES,
+        "us_counties":       getattr(__import__("__main__"), "US_COUNTIES", []),
+    }
+
+    context_block = build_chat_context(current_state, schema)
+
+    # Compose messages: inject context into the first user turn of the window
+    context_prefix = f"{context_block}\n\n=== USER REQUEST ===\n"
+    messages = []
+    for i, turn in enumerate(history):
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": context_prefix + user_message})
+
+    try:
+        client   = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model      = "claude-sonnet-4-20250514",
+            max_tokens = 1024,
+            system     = CHAT_SYSTEM_PROMPT,
+            messages   = messages,
+        )
+        raw_text = response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Anthropic API error: {e}")
+        return jsonify({"error": f"LLM error: {str(e)}"}), 500
+
+    # Parse JSON response from LLM
+    try:
+        # Strip markdown fences if model adds them despite instructions
+        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM returned non-JSON: {raw_text}")
+        return jsonify({
+            "reply":         raw_text,
+            "updates":       {},
+            "trigger_fetch": False,
+        })
+
+    reply         = parsed.get("reply", "")
+    raw_updates   = parsed.get("updates", {})
+    trigger_fetch = bool(parsed.get("trigger_fetch", False))
+
+    # Validate updates against schema before sending to frontend
+    clean_updates = validate_updates(raw_updates, schema)
+
+    return jsonify({
+        "reply":         reply,
+        "updates":       clean_updates,
+        "trigger_fetch": trigger_fetch,
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
