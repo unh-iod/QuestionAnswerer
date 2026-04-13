@@ -62,13 +62,31 @@ async function init() {
   updatePills();
 }
 
+// ── Disability select helpers ─────────────────────────────────────────────────
+// At county level, only PREV supports all disability types.
+// All other county measures are restricted to "disability" (Any Disability) only.
+function disabilityOptionsForCurrentState() {
+  if (S.geoLevel === 'county' && S.measure && S.measure !== 'PREV') {
+    return S.schema.disability_types.filter(d => d.value === 'disability');
+  }
+  return S.schema.disability_types;
+}
+
 // ── Step 1 ────────────────────────────────────────────────────────────────────
 function buildDisabilitySelect() {
-  const sel = $('selectDisability');
-  sel.innerHTML = S.schema.disability_types
+  const sel     = $('selectDisability');
+  const options = disabilityOptionsForCurrentState();
+
+  sel.innerHTML = options
     .map(d => `<option value="${d.value}">${d.label}</option>`)
     .join('');
-  S.disability = S.schema.disability_types[0].value;
+
+  // If current disability value is no longer in the allowed options, reset to first
+  const allowed = options.map(d => d.value);
+  if (!allowed.includes(S.disability)) {
+    S.disability = options[0].value;
+  }
+  sel.value = S.disability;
 }
 
 function buildMeasureGrid() {
@@ -235,9 +253,12 @@ function wireControls() {
     btn.addEventListener('click', () => {
       document.querySelectorAll('#geoLevelControl .seg-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
+      const prevGeoLevel = S.geoLevel;
       S.geoLevel = btn.dataset.value;
-      S.measure  = null;
       S.geos     = [];
+      // Translate the current measure to its equivalent in the new geo level
+      // before onGeoLevelChange resets it to null
+      S.measure = S.measure ? translateMeasure(S.measure, prevGeoLevel, S.geoLevel) : null;
       onGeoLevelChange();
     });
   });
@@ -345,13 +366,35 @@ function wireControls() {
 }
 
 // ── State change handlers ─────────────────────────────────────────────────────
+// Translate a measure value when switching geo levels so the closest equivalent
+// is preserved rather than dropping to null.  Only pairs that map 1-to-1 are
+// translated; everything else is checked for validity in the new measure list.
+const MEASURE_TRANSLATE = {
+  state_to_county: { 'EMP': 'E2PR' },
+  county_to_state: { 'E2PR': 'EMP' },
+};
+
+function translateMeasure(measure, fromLevel, toLevel) {
+  const key  = `${fromLevel}_to_${toLevel}`;
+  const map  = MEASURE_TRANSLATE[key] ?? {};
+  const translated = map[measure] ?? measure;
+  // Verify the translated value actually exists in the target measure list
+  const targetMeasures = toLevel === 'state'
+    ? S.schema.state_measures
+    : S.schema.county_measures;
+  return targetMeasures.some(m => m.value === translated) ? translated : null;
+}
+
 function onGeoLevelChange() {
-  S.measure = null;
-  S.geos    = [];
+  // S.measure has already been translated by the caller (event listener or applyUpdates).
+  // Just proceed with whatever value it holds — buildMeasureGrid will highlight it
+  // if valid, or it stays null if no translation was possible.
+  S.geos = [];
   resetFromStep(2);   // lock steps 2-4 and clear downstream state
   buildMeasureGrid(); // rebuild measure buttons for new geo level
   buildYearSelect();  // rebuild year range for new geo level
-  buildGeoList();     // reset geo list (county list is empty until implemented)
+  buildGeoList();     // reset geo list
+  buildDisabilitySelect(); // re-filter disability options for new geo level
   updatePills();
   checkReadiness();
 }
@@ -362,6 +405,7 @@ function onMeasureOrGeoLevelChange() {
   $('stateFilterWrap').classList.add('hidden');
   $('countyFilterWrap').classList.add('hidden');
   buildGeoList();
+  buildDisabilitySelect(); // re-filter disability options based on new measure
   unlockStep(2);
   // Pre-build age select so the correct options are ready when step 4 unlocks
   if (S.geoLevel === 'state') buildAgeSelect();
@@ -478,54 +522,83 @@ async function fetchData() {
     ? (S.geoLevel === 'state' ? S.schema.state_years : S.schema.county_years)
     : [S.year];
 
-  showLoading(`Loading 0 of ${years.length} file${years.length > 1 ? 's' : ''}…`);
+  const total = years.length;
+  showLoading(`Loading 0 of ${total} file${total > 1 ? 's' : ''}…`);
+
+  // Build the base request body shared across all per-year fetches
+  const baseBody = {
+    geo_level:   S.geoLevel,
+    geographies: S.geos,
+    measure:     S.measure,
+    disability:  S.disability,
+  };
+  if (S.geoLevel === 'state') {
+    baseBody.gender = S.gender;
+    baseBody.race   = S.race;
+    baseBody.age    = S.age;
+  } else {
+    baseBody.i = S.filterI;
+  }
+
+  // Fetch each year individually so we can update the progress counter live.
+  // Requests run sequentially to avoid hammering GCS with parallel downloads.
+  const allRows    = [];
+  let   geo_col    = null;
+  let   allColumns = [];
+  let   loaded     = 0;
 
   try {
-    const body = {
-      geo_level:   S.geoLevel,
-      geographies: S.geos,
-      measure:     S.measure,
-      disability:  S.disability,
-      years:       years,
+    for (const year of years) {
+      const res = await fetch('/api/data', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ...baseBody, years: [year] }),
+      });
+
+      if (!res.ok) {
+        // Non-fatal: warn and skip this year, keep going
+        const err = await res.json().catch(() => ({}));
+        console.warn(`Year ${year} failed:`, err.error ?? res.status);
+        showLoading(`Loading… ${loaded} of ${total} loaded (${year} unavailable)`);
+        continue;
+      }
+
+      const rawText   = await res.text();
+      const cleanText = rawText.replace(/:NaN/g, ':null').replace(/:Inf/g, ':null').replace(/:-Inf/g, ':null');
+      let data;
+      try {
+        data = JSON.parse(cleanText);
+      } catch (parseErr) {
+        console.warn(`Year ${year} parse error:`, parseErr.message);
+        continue;
+      }
+
+      loaded++;
+      showLoading(`Loading… ${loaded} of ${total} file${total > 1 ? 's' : ''}…`);
+
+      // Accumulate rows and track column/geo_col from first successful response
+      allRows.push(...data.rows);
+      if (!geo_col && data.geo_col)       geo_col    = data.geo_col;
+      if (!allColumns.length && data.columns) allColumns = data.columns;
+    }
+
+    if (allRows.length === 0) {
+      showError('No data files could be loaded for the selected combination.');
+      return;
+    }
+
+    const combined = {
+      columns:      allColumns,
+      rows:         allRows,
+      geo_col:      geo_col,
+      total_files:  total,
+      loaded_files: loaded,
     };
 
-    if (S.geoLevel === 'state') {
-      body.gender = S.gender;
-      body.race   = S.race;
-      body.age    = S.age;
-    } else {
-      body.i = S.filterI;
-    }
-
-    const res = await fetch('/api/data', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      showError(err.error || 'Failed to load data.');
-      return;
-    }
-
-    const rawText   = await res.text();
-    const cleanText = rawText.replace(/:NaN/g, ':null').replace(/:Inf/g, ':null').replace(/:-Inf/g, ':null');
-    let data;
-    try {
-      data = JSON.parse(cleanText);
-    } catch (parseErr) {
-      showError('Could not parse server response: ' + parseErr.message);
-      return;
-    }
-
-    showLoading(`Loaded ${data.loaded_files} of ${data.total_files} files…`);
-    await new Promise(r => setTimeout(r, 400));
-
-    S.tableData = data;
+    S.tableData = combined;
     S.sortCol   = null;
-    buildSummaryGeoPicker(data);
-    showResults(data);
+    buildSummaryGeoPicker(combined);
+    showResults(combined);
 
   } catch (e) {
     showError('Network error: ' + e.message);
@@ -837,6 +910,7 @@ function applyUpdates(updates) {
   let geosChanged      = false;
 
   if ('geo_level' in updates && updates.geo_level !== S.geoLevel) {
+    const prevLevel = S.geoLevel;
     S.geoLevel = updates.geo_level;
     geoLevelChanged = true;
     // Update segmented control UI
@@ -845,14 +919,30 @@ function applyUpdates(updates) {
     });
   }
 
-  if ('disability' in updates) {
-    S.disability = updates.disability;
-    $('selectDisability').value = S.disability;
-  }
-
   if ('measure' in updates && updates.measure !== S.measure) {
     S.measure = updates.measure;
     measureChanged = true;
+  } else if (geoLevelChanged) {
+    // The backend already translated the measure (e.g. EMP→E2PR) and sent it
+    // back in updates — apply it and flag as changed so the grid re-highlights.
+    const incoming = updates.measure ?? null;
+    if (incoming !== S.measure) {
+      S.measure = incoming;
+      measureChanged = true;
+    }
+  }
+
+  // Rebuild disability options BEFORE applying the disability value, so that
+  // if the new measure/geo_level restricts options, the value is correctly
+  // clamped to "disability" when needed.
+  if (geoLevelChanged || measureChanged) {
+    buildDisabilitySelect();
+  }
+
+  if ('disability' in updates) {
+    const allowed = disabilityOptionsForCurrentState().map(d => d.value);
+    S.disability = allowed.includes(updates.disability) ? updates.disability : allowed[0];
+    $('selectDisability').value = S.disability;
   }
 
   if ('geographies' in updates) {
