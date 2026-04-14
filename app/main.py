@@ -1,3 +1,8 @@
+
+#gcloud builds submit --tag us-east1-docker.pkg.dev/compendium-402512/compendium-app/compendium-app:latest
+#gcloud run deploy compendium-app --image us-east1-docker.pkg.dev/compendium-402512/compendium-app/compendium-app:latest --platform managed --region us-east1 --allow-unauthenticated --service-account="compendium-question-handler@compendium-402512.iam.gserviceaccount.com" --set-secrets="GCS_BUCKET_NAME=GCS_BUCKET_NAME:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest,GOOGLE_APPLICATION_CREDENTIALS_JSON=GOOGLE_APPLICATION_CREDENTIALS_JSON:latest"
+
+
 import os
 import json
 import time
@@ -5,8 +10,7 @@ import random
 import tempfile
 import logging
 import math
-from dotenv import load_dotenv
-load_dotenv()
+
 from flask import Flask, jsonify, request, render_template
 import pyreadr
 import pandas as pd
@@ -14,6 +18,16 @@ import numpy as np
 from google.cloud import storage
 from google.oauth2 import service_account
 import anthropic
+
+import socket
+import os
+from dotenv import load_dotenv
+
+if socket.gethostname() == "MSI":
+    load_dotenv()
+else:
+    # In production, secrets are injected as environment variables by Cloud Run
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +57,7 @@ def get_anthropic_client() -> anthropic.Anthropic:
     global _anthropic_client
     if _anthropic_client is None:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
+        logger.info(f"ANTHROPIC_API_KEY present: {bool(api_key)}, length: {len(api_key) if api_key else 0}, prefix: {api_key[:8] if api_key else 'None'}")
         if not api_key:
             raise RuntimeError("ANTHROPIC_API_KEY not configured")
         _anthropic_client = anthropic.Anthropic(api_key=api_key, max_retries=0)
@@ -402,8 +417,6 @@ def api_data():
             geo_col = col
             break
 
-    print(combined)
-    print(geo_col,geos)
     # Filter to selected geographies if a geo column was found and geos requested
     if geo_col and geos and "All" not in geos:
         pattern = '|'.join(geos)
@@ -711,7 +724,9 @@ def api_chat():
 
         except Exception as e:
             last_exc = e
-            logger.error(f"Unexpected error calling Anthropic: {e}")
+            logger.error(f"Unexpected error calling Anthropic: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return jsonify({"error": f"LLM error: {str(e)}"}), 500
 
     if last_exc is not None:
