@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from google.cloud import storage
 from google.oauth2 import service_account
-import anthropic
+import openai
 
 import socket
 import os
@@ -23,13 +23,17 @@ if socket.gethostname() == "MSI":
 else:
     pass
 
+from health_check import register_health_routes  # Add to imports
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+register_health_routes(app)  # Add after app creation
 
 GCS_BUCKET = os.environ.get("GCS_BUCKET_NAME")
 
+# ── GCS configuration ──────────────────────────────────────────────────────────
 def get_gcs_client():
     """Return a GCS client using env-var credentials."""
     creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -37,23 +41,32 @@ def get_gcs_client():
         creds_info = json.loads(creds_json)
         creds = service_account.Credentials.from_service_account_info(creds_info)
         return storage.Client(credentials=creds)
+    # Fallback: use GOOGLE_APPLICATION_CREDENTIALS file path or ADC
     return storage.Client()
 
-_anthropic_client: anthropic.Anthropic | None = None
+# ── OpenAI-compatible singleton client ────────────────────────────────────────
+# Created once at module level so we don't pay HTTP connection setup per request.
+# max_retries=0 disables the SDK's built-in retry logic — we handle retries
+# ourselves with exponential backoff so we don't multiply requests on 429s.
+_openai_client: openai.OpenAI | None = None
 
-def get_anthropic_client() -> anthropic.Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        logger.info(f"ANTHROPIC_API_KEY present: {bool(api_key)}, length: {len(api_key) if api_key else 0}, prefix: {api_key[:8] if api_key else 'None'}")
+def get_openai_client() -> openai.OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.environ.get("DEEPTHOUGHT_API_KEY")
+        logger.info(f"DEEPTHOUGHT_API_KEY present: {bool(api_key)}, length: {len(api_key) if api_key else 0}, prefix: {api_key[:8] if api_key else 'None'}")
         if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not configured")
-        _anthropic_client = anthropic.Anthropic(api_key=api_key, max_retries=0)
-        logger.info("Anthropic client initialised (max_retries=0, backoff managed by app)")
-    return _anthropic_client
+            raise RuntimeError("DEEPTHOUGHT_API_KEY not configured")
+        base_url = "https://dtcontroller.sr.unh.edu:4242/openai/v1"
+        _openai_client = openai.OpenAI(api_key=api_key, base_url=base_url, max_retries=3, timeout=30.0)
+        logger.info("OpenAI-compatible client initialised (max_retries=3, backoff managed by app)")
+    return _openai_client
 
-ANTHROPIC_MAX_RETRIES = 5
-ANTHROPIC_BASE_DELAY  = 1.0
+# ── LLM API retry constants ────────────────────────────────────────────────────
+LLM_MAX_RETRIES = 5
+LLM_BASE_DELAY  = 1.0
+
+# ── Data schema constants ──────────────────────────────────────────────────────
 
 DISABILITY_TYPES = [
     {"value": "disability",        "label": "Any Disability"},
@@ -65,6 +78,7 @@ DISABILITY_TYPES = [
     {"value": "selfcare",          "label": "Self-Care Difficulty"},
 ]
 
+# US/State measures
 STATE_MEASURES = [
     {"value": "AP",        "label": "All People",                          "group": "Population"},
     {"value": "APwD",      "label": "All People with Disabilities",        "group": "Population"},
@@ -81,6 +95,7 @@ STATE_MEASURES = [
     {"value": "COLLDMORE", "label": "College Degree or More",              "group": "Education"},
 ]
 
+# County measures
 COUNTY_MEASURES = [
     {"value": "PREV",       "label": "Disability Prevalence",              "group": "Population"},
     {"value": "POVERTY",    "label": "Percent in Poverty",                 "group": "Economic"},
@@ -92,9 +107,11 @@ COUNTY_MEASURES = [
     {"value": "INSURANCE2", "label": "Health Insurance (Type 2)",          "group": "Social"},
 ]
 
+# Age group options per measure group
 STATE_YEAR_RANGE  = list(range(2017, 2025))
 COUNTY_YEAR_RANGE = list(range(2012, 2025))
 
+# Map each measure to its age group set
 AGE_GROUPS = {
     "population": [
         {"value": "All",              "label": "All"},
@@ -172,6 +189,8 @@ RACE_OPTIONS = [
     {"value": "NonHispanicWhite",   "label": "Non-Hispanic White"},
 ]
 
+# i-index lookup: (gender_is_any, race_is_any, age_is_any) -> i
+# Row order from spec (1-based), row 8 (Any/Any/Any) is excluded/invalid
 I_LOOKUP = {
     (False, False, False): 1,
     (False, False, True):  2,
@@ -182,6 +201,7 @@ I_LOOKUP = {
     (True,  True,  False): 7,
 }
 
+# County filter combinations vary by measure
 COUNTY_FILTERS_PREV = [
     {"i": 1, "label": "Gender: All  |  Age Group: All"},
     {"i": 2, "label": "Gender: All  |  Age Group: Any"},
@@ -211,6 +231,7 @@ US_STATES = [
 
 US_COUNTIES = pd.read_csv('counties.csv')['x'].to_list()
 
+# ── Helper functions ───────────────────────────────────────────────────────────
 def get_county_filters(measure):
     if measure == "PREV":
         return COUNTY_FILTERS_PREV
@@ -287,6 +308,8 @@ def sanitize(v):
     if isinstance(v, (np.bool_,)):
         return bool(v)
     return v
+
+# ── API routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -416,6 +439,9 @@ def api_check_files():
         results[year] = blob_exists(fname)
     return jsonify(results)
 
+# ── Chat endpoint ──────────────────────────────────────────────────────────────
+# Build the system prompt ONCE at startup, embedding the full schema as static context.
+
 def _build_system_prompt() -> str:
     lines = []
     lines.append(
@@ -498,6 +524,7 @@ def _build_system_prompt() -> str:
 
     return "\n".join(lines)
 
+# Built once at module load — all subsequent requests reuse this string.
 CHAT_SYSTEM_PROMPT: str = _build_system_prompt()
 logger.info(f"Chat system prompt built: {len(CHAT_SYSTEM_PROMPT):,} chars")
 
@@ -615,7 +642,7 @@ def api_chat():
         return jsonify({"error": "Empty message."}), 400
 
     try:
-        client = get_anthropic_client()
+        client = get_openai_client()
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
@@ -626,55 +653,58 @@ def api_chat():
     for i, turn in enumerate(history):
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": context_prefix + user_message})
-
+    
+    # ── Call API with exponential backoff for 429 overload errors ────
+    # Uses the OpenAI-compatible endpoint. The system prompt is prepended to
+    # every request — if CHAT_SYSTEM_PROMPT is ≥1,024 tokens and stable,
+    # the provider will automatically cache the prefix server-side, reducing
+    # input token costs on subsequent hits without any explicit configuration.
     raw_text = None
     last_exc = None
 
-    for attempt in range(ANTHROPIC_MAX_RETRIES):
+    for attempt in range(LLM_MAX_RETRIES):
         try:
-            response = client.messages.create(
-                model      = "claude-haiku-4-5-20251001",
-                max_tokens = 2048,
-                system     = [
-                    {
-                        "type": "text",
-                        "text": CHAT_SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages   = messages,
+            response = client.chat.completions.create(
+                            model      = "ets:aws:us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                            max_tokens = 2048,
+                            messages   = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + messages,
             )
-            raw_text = response.content[0].text.strip()
+            raw_text = response.choices[0].message.content.strip()
             last_exc = None
-            break
+            break  # success — exit retry loop
 
-        except anthropic.APIStatusError as e:
+        except openai.APIStatusError as e:
             last_exc = e
-            if e.status_code == 529:
-                delay = ANTHROPIC_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+            if e.status_code == 429:
+                delay = LLM_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
                 request_id = getattr(e.response, "headers", {}).get("request-id", "unknown")
                 logger.warning(
-                    f"Anthropic 529 overloaded (attempt {attempt + 1}/{ANTHROPIC_MAX_RETRIES}), "
+                    f"LLM 429 overloaded (attempt {attempt + 1}/{LLM_MAX_RETRIES}), "
                     f"request_id={request_id}. Retrying in {delay:.2f}s..."
                 )
                 time.sleep(delay)
                 continue
-            logger.error(f"Anthropic API error {e.status_code}: {e}")
+            # Non-429 API error — don't retry
+            logger.error(f"LLM API error {e.status_code}: {e}")
             return jsonify({"error": f"API error: {str(e)}"}), 500
 
         except Exception as e:
             last_exc = e
-            logger.error(f"Unexpected error calling Anthropic: {type(e).__name__}: {e}")
+            logger.error(f"Unexpected error calling LLM: {type(e).__name__}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return jsonify({"error": f"LLM error: {str(e)}"}), 500
 
     if last_exc is not None:
-        logger.error(f"Anthropic still overloaded after {ANTHROPIC_MAX_RETRIES} attempts: {last_exc}")
+        # All retries exhausted — return a user-friendly 503 instead of crashing
+        logger.error(f"LLM still overloaded after {LLM_MAX_RETRIES} attempts: {last_exc}")
         return jsonify({
             "error": "The AI assistant is temporarily unavailable due to high demand. Please try again in a moment."
         }), 503
 
+    # ── Parse JSON response from LLM ───────────────────────────────────────────
+    # Extract the outermost { ... } from the response, tolerating any text the
+    # model may have leaked before the opening brace or after the closing brace.
     def extract_json(text: str) -> dict | None:
         start = text.find("{")
         end   = text.rfind("}")
@@ -700,9 +730,13 @@ def api_chat():
     raw_updates   = parsed.get("updates", {})
     trigger_fetch = bool(parsed.get("trigger_fetch", False))
 
+    # Validate updates against schema before sending to frontend
     # Sequential validation
     clean_updates = validate_updates(raw_updates, current_state)
 
+    # Build full state: start from current selections, overlay validated changes.
+    # This ensures the frontend always receives every filter key — not just the
+    # ones that changed — so it can do a full replacement rather than a partial merge.
     full_state = {
         "geo_level":   current_state.get("geo_level",   "state"),
         "disability":  current_state.get("disability",  "disability"),
