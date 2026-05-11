@@ -1,0 +1,2 @@
+#gcloud builds submit --tag us-east1-docker.pkg.dev/compendium-402512/compendium-app/compendium-app:latest
+#gcloud run deploy compendium-app --image us-east1-docker.pkg.dev/compendium-402512/compendium-app/compendium-app:latest --platform managed --region us-east1 --allow-unauthenticated --service-account="compendium-question-handler@compendium-402512.iam.gserviceaccount.com" --set-secrets="GCS_BUCKET_NAME=GCS_BUCKET_NAME:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest,GOOGLE_APPLICATION_CREDENTIALS_JSON=GOOGLE_APPLICATION_CREDENTIALS_JSON:latest"
