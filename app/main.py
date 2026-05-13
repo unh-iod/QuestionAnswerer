@@ -5,6 +5,7 @@ import random
 import tempfile
 import logging
 import math
+import requests
 
 from flask import Flask, jsonify, request, render_template
 import pyreadr
@@ -783,6 +784,11 @@ def api_chat():
         "updates":       full_state,
         "trigger_fetch": trigger_fetch,
     })
+
+@app.route("/checkip")
+def checkip():
+        response = requests.get('https://api.ipify.org?format=json')
+        return response.json()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
